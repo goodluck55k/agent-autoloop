@@ -72,7 +72,7 @@ export function System({ local, refresh, edit }: { local: Settings | null; refre
           <button disabled={busy || proc.owned || !local} onClick={() => run("start")}>
             启动原生进程
           </button>
-          <button disabled={busy || !proc.owned} onClick={() => confirm("停止本客户端启动的 up 进程？") && run("stop")}>
+          <button disabled={busy || !proc.owned} onClick={() => confirm("停止本客户端启动的 up 进程？有任务执行时会被拒绝。") && run("stop")}>
             停止原生进程
           </button>
           <button

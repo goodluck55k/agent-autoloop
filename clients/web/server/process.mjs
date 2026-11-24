@@ -10,8 +10,37 @@ const cli = resolve(import.meta.dirname, "../../../bin/agent-autoloop.ts");
 const exec = promisify(execFile);
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 let child;
+let ownedUrl;
 let lastOutput = "";
 export const processStatus = () => ({ owned: Boolean(child), output: lastOutput });
+
+/**
+ * Tasks the hub is still working on: claimed now, or queued for a worker. A stop that would take the hub away from them
+ * waits by default. Null means the count could not be read, not that nothing is running.
+ */
+export async function activeTasks(url) {
+  let config;
+  try {
+    config = readConfig();
+  } catch {
+    return null;
+  }
+  if (!config.owner) return null;
+  try {
+    const response = await fetch((url ?? config.url).replace(/\/$/, "") + "/v1/state", {
+      headers: { authorization: "Bearer " + config.owner },
+      signal: AbortSignal.timeout(3000),
+      redirect: "error",
+    });
+    if (!response.ok) return null;
+    const state = await response.json();
+    const running = Number(state?.totals?.running ?? 0);
+    const queued = Number(state?.totals?.queued ?? 0);
+    return { running, queued, total: running + queued };
+  } catch {
+    return null;
+  }
+}
 
 export async function hubHealthy(url) {
   try {
@@ -27,10 +56,12 @@ export async function hubHealthy(url) {
   }
 }
 
-function startHub() {
+function startHub(url) {
   if (child) return child;
   const next = spawn(process.execPath, [cli, "up"], { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
   child = next;
+  // Keep the address this child was started for: a later connection edit must not make a stop check another hub.
+  ownedUrl = url;
   lastOutput = "";
   for (const pipe of [next.stdout, next.stderr]) {
     pipe.setEncoding("utf8");
@@ -43,12 +74,13 @@ function startHub() {
   });
   next.once("close", () => {
     if (child === next) child = undefined;
+    if (child === undefined) ownedUrl = undefined;
   });
   return next;
 }
 
-async function launchHub() {
-  const next = startHub();
+async function launchHub(url) {
+  const next = startHub(url);
   await new Promise((resolve, reject) => {
     if (next.exitCode !== null) return reject(new Error(lastOutput.trim() || "原生 up 进程立即退出了"));
     next.once("spawn", resolve);
@@ -82,7 +114,7 @@ export async function ensureHub({ log = () => {}, timeout = 45_000 } = {}) {
     log(`检测到 Hub 正在启动（进程 ${running}），等待健康检查…`);
   } else {
     log("没有检测到运行中的 Hub，正在通过原生 CLI 启动 Hub 和 Worker…");
-    await launchHub();
+    await launchHub(url);
     launched = true;
   }
   const end = Date.now() + timeout;
@@ -114,14 +146,15 @@ export async function ensureHub({ log = () => {}, timeout = 45_000 } = {}) {
 
 export async function command(action) {
   if (action === "start") {
-    readConfig();
+    const config = readConfig();
     if (child || runningUp() !== null) throw new Error("本机已有运行中的 up 进程");
     lastOutput = "";
-    await launchHub();
+    await launchHub(config.url);
     return { output: "已调用 up，连接状态以 Hub 响应为准。" };
   }
   if (action === "stop") {
-    if (!(await stopHub())) throw new Error("只能停止本客户端启动的 up 进程");
+    const result = await stopHub();
+    if (!result.owned) throw new Error("只能停止本客户端启动的 up 进程");
     return { output: "已停止本客户端启动的 up 进程。" };
   }
   if (!["doctor", "update"].includes(action)) throw new Error("未知的 CLI 操作");
@@ -135,24 +168,45 @@ export async function command(action) {
   }
 }
 
-/** Stops only the up process this console started; false when there is none. */
-export async function stopHub() {
+/** Stops only the up process this console started, after its tasks are done unless `force` says otherwise. */
+export async function stopHub({ force = false } = {}) {
   const next = child;
-  if (!next) return false;
-  await new Promise((resolve) => {
-    const done = setTimeout(resolve, 5000);
-    next.once("close", () => {
-      clearTimeout(done);
-      resolve();
-    });
+  if (!next) return { owned: false };
+  if (!force) {
+    const active = await activeTasks(ownedUrl);
+    if (!active) {
+      const error = new Error(
+        "无法确认 Hub 上是否还有任务，暂不停止。请稍后重试；确实需要立即停止，请运行 stop.cmd --force。",
+      );
+      error.status = 409;
+      throw error;
+    }
+    if (active.total) {
+      const error = new Error(
+        `还有 ${active.running} 个任务正在执行、${active.queued} 个等待执行，暂不停止。` +
+          "请等任务完成后再停止；确实需要立即停止，请运行 stop.cmd --force。",
+      );
+      error.status = 409;
+      throw error;
+    }
+  }
+  let timer;
+  const closed = await new Promise((resolve) => {
+    const done = (value) => {
+      clearTimeout(timer);
+      resolve(value);
+    };
+    timer = setTimeout(() => done(false), 5000);
+    next.once("close", () => done(true));
+    if (next.exitCode !== null) return done(true);
     try {
       next.kill();
     } catch {
-      clearTimeout(done);
-      resolve();
+      done(next.exitCode !== null);
     }
   });
-  return true;
+  if (!closed) throw new Error("中台进程没有在 5 秒内退出，本地控制台仍在运行。");
+  return { owned: true };
 }
 
 process.on("exit", () => child?.kill());

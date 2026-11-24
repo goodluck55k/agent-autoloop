@@ -44,9 +44,10 @@ async function api(req, res, path, query) {
   if (!post && path === "/local") return localSettings();
   if (!post && path === "/process") return processStatus();
   if (post && path === "/shutdown") {
-    const hubOwned = processStatus().owned;
-    setTimeout(shutdown, 50);
-    return { ok: true, hubOwned };
+    const force = body.force === true;
+    const result = await stopHub({ force });
+    setTimeout(finish, 50);
+    return { ok: true, hubOwned: result.owned, forced: force };
   }
   if (post && path.startsWith("/cli/")) return command(path.slice(5));
   if (post && path === "/connection") return saveConnection(body);
@@ -148,12 +149,20 @@ const server = createServer(async (req, res) => {
     json(res, { error: e.message === "fetch failed" ? "无法连接 Hub，请检查系统设置中的地址和进程。" : e.message });
   }
 });
-function shutdown() {
-  stopHub().finally(() => {
-    clearRuntime(process.pid);
-    server.close();
-    process.exit(0);
-  });
+function finish() {
+  clearRuntime(process.pid);
+  server.close();
+  process.exit(0);
+}
+
+async function shutdown() {
+  try {
+    await stopHub();
+  } catch (error) {
+    console.error(error.message);
+    return;
+  }
+  finish();
 }
 
 async function listen() {

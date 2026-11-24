@@ -8,7 +8,7 @@ if errorlevel 1 (
   pause
   exit /b 1
 )
-node server\stop.mjs
+node server\stop.mjs %*
 if errorlevel 1 (
   pause
   exit /b 1
